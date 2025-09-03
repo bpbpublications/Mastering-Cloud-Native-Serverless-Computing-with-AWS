@@ -1,0 +1,240 @@
+1) cft-s3-lambda.yml
+
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Deploy an S3 bucket and a Lambda function triggered by file uploads.
+Resources:
+  MyS3Bucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: my-serverless-s3-bucket
+  MyLambdaFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: MyS3TriggerLambda
+      Runtime: python3.9
+      Handler: index.handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Code:
+        ZipFile: |
+          import json
+          def handler(event, context):
+              print("Event: ", json.dumps(event))
+              return {"statusCode": 200, "body": "File processed successfully"}
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: S3AccessPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                Resource: !Sub "${MyS3Bucket.Arn}/*"
+  S3BucketPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref MyLambdaFunction
+      Action: lambda:InvokeFunction
+      Principal: s3.amazonaws.com
+      SourceArn: !GetAtt MyS3Bucket.Arn
+Outputs:
+  BucketName:
+    Value: !Ref MyS3Bucket
+    Description: Name of the S3 bucket
+  LambdaFunctionName:
+    Value: !Ref MyLambdaFunction
+    Description: Name of the Lambda function
+
+
+2) cdk_rest_api_stack.py
+
+from aws_cdk import (
+    Stack,
+    aws_dynamodb as dynamodb,
+    aws_lambda as _lambda,
+    aws_apigateway as apigateway
+)
+from constructs import Construct
+class CdkRestApiStack(Stack):
+    def __init__(self, scope: Construct, construct_id: str, **kwargs) -> None:
+        super().__init__(scope, construct_id, **kwargs)
+        # Create a DynamoDB Table
+        dynamo_table = dynamodb.Table(
+            self, "InformationTable",
+            partition_key=dynamodb.Attribute(name="id", type=dynamodb.AttributeType.STRING),
+            billing_mode=dynamodb.BillingMode.PAY_PER_REQUEST  # Added best practice
+        )
+        # Create a Python Lambda Function for processing
+        information_lambda = _lambda.Function(
+            self, "InformationFunction",
+            runtime=_lambda.Runtime.PYTHON_3_12,
+            handler="index.lambda_handler",  # Corrected for Python
+            code=_lambda.Code.from_asset("lambda"),  # Ensure this directory exists
+            environment={
+                "TABLE_NAME": dynamo_table.table_name
+            }
+        )
+        # Grant Lambda Function access to DynamoDB Table
+        dynamo_table.grant_read_write_data(information_lambda)
+        # Create an API Gateway REST API
+        information_api = apigateway.RestApi(
+            self, "InformationAPI",
+            rest_api_name="Informational Service"
+        )
+        # Define a resource and method for the Information API
+        information = information_api.root.add_resource("information")
+        information.add_method("POST", apigateway.LambdaIntegration(information_lambda))
+        information.add_method("GET", apigateway.LambdaIntegration(information_lambda))
+
+3) index.py
+
+import os
+import boto3
+import json
+from botocore.exceptions import BotoCoreError, ClientError
+
+dynamodb = boto3.resource("dynamodb")
+table = dynamodb.Table(os.getenv("TABLE_NAME", ""))
+
+def handler(event, context):
+    try:
+        if event["httpMethod"] == "POST":
+            body = json.loads(event["body"])
+            if not isinstance(body, dict) or "id" not in body:
+                return {"statusCode": 400, "body": json.dumps({"message": "Invalid input"})}
+            table.put_item(Item=body)
+            return {"statusCode": 201, "body": json.dumps({"message": "Item added"})}
+        
+        if event["httpMethod"] == "GET":
+            return {"statusCode": 200, "body": json.dumps(table.scan(Limit=10).get("Items", []))}
+        
+        return {"statusCode": 400, "body": json.dumps({"message": "Unsupported method"})}
+    
+    except (BotoCoreError, ClientError) as e:
+        return {"statusCode": 500, "body": json.dumps({"message": f"DynamoDB error: {str(e)}"})}
+    except json.JSONDecodeError:
+        return {"statusCode": 400, "body": json.dumps({"message": "Invalid JSON"})}
+    except Exception as e:
+        return {"statusCode": 500, "body": json.dumps({"message": f"Error: {str(e)}"})}
+
+
+4) template.yaml
+
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: SAM Stack
+Resources:
+  InformationTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: Information
+      AttributeDefinitions:
+        - AttributeName: id
+          AttributeType: S
+      KeySchema:
+        - AttributeName: id
+          KeyType: HASH
+      BillingMode: PAY_PER_REQUEST
+  InformationFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      Handler: index.lambda_handler
+      Runtime: python3.12
+      CodeUri: lambda/
+      Environment:
+        Variables:
+          TABLE_NAME: !Ref InformationTable
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref InformationTable
+  InformationAPI:
+    Type: AWS::Serverless::Api
+    Properties:
+      Name: Informational Service
+      StageName: prod
+      DefinitionBody:
+        swagger: "2.0"
+        info:
+          title: "Information API"
+        paths:
+          /information:
+            post:
+              x-amazon-apigateway-integration:
+                type: aws_proxy
+                uri: !Sub arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${InformationFunction.Arn}/invocations
+                httpMethod: POST
+                passthroughBehavior: when_no_match
+            get:
+              x-amazon-apigateway-integration:
+                type: aws_proxy
+                uri: !Sub arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${InformationFunction.Arn}/invocations
+                httpMethod: GET
+                passthroughBehavior: when_no_match
+Outputs:
+  ApiEndpoint:
+    Description: "API Gateway endpoint URL"
+    Value: !Sub "https://${InformationAPI}.execute-api.${AWS::Region}.amazonaws.com/prod/information"
+
+
+5) app.py
+
+import os
+import boto3
+import json
+from botocore.exceptions import BotoCoreError, ClientError
+
+dynamodb = boto3.resource("dynamodb")
+table = dynamodb.Table(os.getenv("TABLE_NAME", ""))
+
+def handler(event, context):
+    try:
+        if event["httpMethod"] == "POST":
+            body = json.loads(event["body"])
+            if not isinstance(body, dict) or "id" not in body:
+                return {"statusCode": 400, "body": json.dumps({"message": "Invalid input"})}
+            table.put_item(Item=body)
+            return {"statusCode": 201, "body": json.dumps({"message": "Item added"})}
+        
+        if event["httpMethod"] == "GET":
+            return {"statusCode": 200, "body": json.dumps(table.scan(Limit=10).get("Items", []))}
+        
+        return {"statusCode": 400, "body": json.dumps({"message": "Unsupported method"})}
+    
+    except (BotoCoreError, ClientError) as e:
+        return {"statusCode": 500, "body": json.dumps({"message": f"DynamoDB error: {str(e)}"})}
+    except json.JSONDecodeError:
+        return {"statusCode": 400, "body": json.dumps({"message": "Invalid JSON"})}
+    except Exception as e:
+        return {"statusCode": 500, "body": json.dumps({"message": f"Error: {str(e)}"})}
+
+
+6) buildspec.yaml
+
+version: 0.2
+phases:
+  install:
+    runtime-versions:
+      python: 3.12
+    commands:
+      - pip install aws-sam-cli  # Installs the AWS SAM CLI to enable build and packaging
+  build:
+    commands:
+      - sam build  # Compiles the application and prepares dependencies in .aws-sam directory
+      - sam package --output-template-file packaged.yaml --s3-bucket <your-s3-bucket>  
+        # Packages the compiled application and uploads it to the specified S3 bucket
+artifacts:
+  files:
+    - packaged.yaml  # The transformed template that will be used for deployment
+
+
+7) 
